@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <memory.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -179,11 +180,17 @@ typedef struct Instruction {
     u8 op;
 } Instruction;
 
+typedef enum ExportType {
+    EXPORT_TYPE_FUNCTION,
+    EXPORT_TYPE_TYPE,
+    EXPORT_TYPE_ENUM_END,
+} ExportType;
+
 typedef struct Export {
     String name;
     u32 module_id;
     u32 target_index;
-    u8 kind;
+    ExportType type;
 } Export;
 
 typedef struct Import {
@@ -199,9 +206,9 @@ typedef struct Import {
 #define PERMISSION_FLAG_GIT 16
 
 typedef struct Metadata {
-    String project_config_path;
+    String config;
     u32 entry_module_id;
-    u32 permission_defaults;
+    u32 permissions;
 } Metadata;
 
 typedef struct Program {
@@ -392,6 +399,14 @@ INLINE int read_string(Section *s, String *string) {
     return 0;
 }
 
+INLINE int get_string(Section *s, String *string) {
+    CHECK(read_u32(s, &string->length));
+    if (s->index + string->length >= s->size) return 1;
+    string->data = (char*)(s->data + s->start + s->index);
+    s->index += string->length;
+    return 0;
+}
+
 INLINE void safe_free(void *ptr) {
     if (ptr != NULL) free(ptr);
 }
@@ -468,6 +483,7 @@ INLINE int parse_const_pool(Section s, Program *program) {
             default: break;
         }
     }
+    if (s.index != s.size - 1) return 1;
     return 0;
 }
 
@@ -494,6 +510,89 @@ INLINE int parse_function_table(Section s, Program *program) {
         function->param_names = calloc(function->n_param_names, sizeof(String));
         for (u32 j = 0; j < function->n_param_names; j++) CHECK(read_string(&s, &function->param_names[j]));
     }
+    if (s.index != s.size - 1) return 1;
+    return 0;
+}
+
+INLINE void free_function_table(Program *program) {
+    for (u32 i = 0; i < program->n_functions; i++) {
+        Function *function = &program->functions[i];
+        for (u32 j = 0; j < function->n_param_names; j++) safe_free(function->param_names[j].data);
+        safe_free(function->param_names);
+    }
+    safe_free(program->functions);
+}
+
+INLINE int parse_code_section(Section s, Program *program) {
+    SECTION_PARSER_START(code, Instruction, 12);
+    for (u32 i = 0; i < program->n_code; i++) {
+        Instruction *instruction = &program->code[i];
+        CHECK(read_u8(&s, &instruction->op));
+        CHECK(read_u8(&s, &instruction->flags));
+        CHECK(read_u16(&s, &instruction->a));
+        CHECK(read_u32(&s, &instruction->b));
+        CHECK(read_u32(&s, &instruction->c));
+    }
+    if (s.index != s.size - 1) return 1;
+    return 0;
+}
+
+INLINE int parse_export_table(Section s, Program *program) {
+    SECTION_PARSER_START(exports, Export, 16);
+    for (u32 i = 0; i < program->n_exports; i++) {
+        Export *export = &program->exports[i];
+        CHECK(read_u32(&s, &export->module_id));
+        u8 temp;
+        CHECK(read_u8(&s, &temp));
+        if (temp >= EXPORT_TYPE_ENUM_END) return 1;
+        export->type = temp;
+        CHECK(read_u8(&s, NULL));
+        CHECK(read_u16(&s, NULL));
+        CHECK(read_string(&s, &export->name));
+        CHECK(read_u32(&s, &export->target_index));
+    }
+    if (s.index != s.size - 1) return 1;
+    return 0;
+}
+
+INLINE void free_export_table(Program *program) {
+    for (u32 i = 0; i < program->n_exports; i++) safe_free(program->exports[i].name.data);
+    safe_free(program->exports);
+}
+
+INLINE int parse_import_table(Section s, Program *program) {
+    SECTION_PARSER_START(imports, Import, 12);
+    for (u32 i = 0; i < program->n_imports; i++) {
+        Import *import = &program->imports[i];
+        CHECK(read_u32(&s, &import->module_id));
+        CHECK(read_u32(&s, &import->target_module_id));
+        CHECK(read_string(&s, &import->alias));
+    }
+    if (s.index != s.size - 1) return 1;
+    return 0;
+}
+
+INLINE void free_import_table(Program *program) {
+    for (u32 i = 0; i < program->n_imports; i++) safe_free(program->imports[i].alias.data);
+    safe_free(program->imports);
+}
+
+INLINE bool string_equal(String lhs, const char *rhs) {
+    if (lhs.length != strlen(rhs)) return false;
+    if (memcmp(lhs.data, rhs, lhs.length)) return false;
+    return true;
+}
+
+INLINE int parse_metadata(Section s, Program *program) {
+    CHECK(read_u32(&s, &program->metadata.entry_module_id));
+    program->metadata.permissions = 0;
+    for (u32 i = 0; i < 5; i++) {
+        String string;
+        CHECK(get_string(&s, &string));
+        if (string_equal(string, "allowed")) program->metadata.permissions |= 1 << i;
+        else if (!string_equal(string, "blocked")) return 1;
+    }
+    CHECK(read_string(&s, &program->metadata.config));
     if (s.index != s.size - 1) return 1;
     return 0;
 }
@@ -531,9 +630,19 @@ int parse_container(MappedFile file) {
 
     if (parse_module_table(*required[SECTION_ID_MODULE_TABLE], &program)) goto error2;
     if (parse_const_pool(*required[SECTION_ID_CONST_POOL], &program)) goto error3;
+    if (parse_function_table(*required[SECTION_ID_FUNCTION_TABLE], &program)) goto error4;
+    if (parse_code_section(*required[SECTION_ID_CODE_SECTION], &program)) goto error5;
+    if (parse_export_table(*required[SECTION_ID_EXPORT_TABLE], &program)) goto error6;
+    if (parse_import_table(*required[SECTION_ID_IMPORT_TABLE], &program)) goto error7;
+    if (parse_metadata(*required[SECTION_ID_METADATA], &program)) goto error8;
 
     return 0;
 
+    error8: safe_free(program.metadata.config.data);
+    error7: free_import_table(&program);
+    error6: free_export_table(&program);
+    error5: safe_free(program.code);
+    error4: free_function_table(&program);
     error3: free_const_pool(&program);
     error2: free_module_table(&program);
     error1: free(sections);
@@ -544,7 +653,7 @@ int main(int argc, const char** argv) {
     if (argc != 2) return 1;
     MappedFile file = memory_map_file(argv[1]);
     if (file.memory == NULL) return 1;
-    if (parse_container(file) != 0) goto error;
+    if (parse_container(file)) goto error;
     memory_unmap_file(file);
 
     return 0;
