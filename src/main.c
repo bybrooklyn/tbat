@@ -33,10 +33,16 @@ typedef struct Header {
     u16 section_count;
 } Header;
 
+typedef struct Section {
+    u8 *data;
+    u32 start;
+    u32 size;
+    u32 index;
+} Section;
+
 typedef struct SectionHeader {
     u32 offset;
     u32 size;
-    u32 reserved;
     u16 flags;
     u16 id;
 } SectionHeader;
@@ -89,12 +95,12 @@ typedef struct ListString {
 typedef struct Function {
     String* param_names;
     String name;
-    u32 n_param_names;
     u32 module_id;
     u32 id;
     u32 code_offset;
     u32 code_length;
     u16 register_count;
+    u16 n_param_names;
 } Function;
 
 typedef struct BuiltIn {
@@ -167,7 +173,10 @@ typedef struct Constant {
 } Constant;
 
 typedef struct Instruction {
-
+    u32 b, c;
+    u16 a;
+    u8 flags;
+    u8 op;
 } Instruction;
 
 typedef struct Export {
@@ -235,6 +244,42 @@ typedef enum InstructionType {
 #define LIKELY(expr)   (expr)
 #endif
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#else
+#error unsupported platform
+#endif
+
+typedef struct MappedFile {
+#ifdef __linux__
+    void* memory;
+    size_t size;
+    int fd;
+#endif
+} MappedFile;
+
+INLINE MappedFile memory_map_file(const char* path) {
+#ifdef __linux__
+    MappedFile file = {.fd = open(path, O_RDONLY, 0644)};
+    struct stat sb;
+    fstat(file.fd, &sb);
+    file.size = sb.st_size;
+    file.memory = mmap(NULL, file.size, PROT_READ, MAP_SHARED, file.fd, 0);
+    return file;
+#endif
+}
+
+INLINE void memory_unmap_file(MappedFile file) {
+#ifdef __linux__
+    msync(file.memory, file.size, MS_SYNC);
+    munmap(file.memory, file.size);
+    close(file.fd);
+#endif
+}
+
 INLINE bool is_little_endian() {
     unsigned int i = 1;
     char *c = (char *)&i;
@@ -276,11 +321,13 @@ MAKE_SWAP_FUNCTION(u64, __builtin_bswap64(v), _byteswap_uint64(v),
 
 #define swap_u8(v) v
 #define MAKE_VALUE_READER(sign, bits)\
-    INLINE int read_##sign##bits(FILE *file, sign##bits *value) {\
-        if (value == NULL) {\
-            sign##bits fake;\
-            if (fread(&fake, sizeof(sign##bits), 1, file) != sizeof(sign##bits)) return 1;\
-        } else if (fread(value, sizeof(sign##bits), 1, file) != sizeof(sign##bits)) return 1;\
+    INLINE int read_##sign##bits(Section *s, sign##bits *value) {\
+        if (s->index + sizeof(sign##bits) >= s->size) return 1;\
+        if (value != NULL) {\
+            memcpy(value, s->data + s->start + s->index, sizeof(sign##bits));\
+            *value = swap_u##bits(*value);\
+        }\
+        s->index += sizeof(sign##bits);\
         return 0;\
     }
 
@@ -306,35 +353,42 @@ INLINE u32 magic_int() {
     {int _code = code;\
     if (code != 0) return code;}
 
-INLINE int parse_header(FILE *file, Header *header) {
+INLINE int parse_header(Section *s, Header *header) {
     u32 start;
-    if (!read_u32(file, &start) && start == magic_int()) return 1;
-    CHECK(read_u16(file, &header->major));
-    CHECK(read_u16(file, &header->minor));
-    CHECK(read_u32(file, &header->flags));
-    CHECK(read_u16(file, &header->section_count));
+    if (!read_u32(s, &start) && start == magic_int()) return 1;
+    CHECK(read_u16(s, &header->major));
+    CHECK(read_u16(s, &header->minor));
+    CHECK(read_u32(s, &header->flags));
+    CHECK(read_u16(s, &header->section_count));
     if (header->section_count == 0) return 1;
-    CHECK(read_u16(file, NULL));
+    CHECK(read_u16(s, NULL));
     return 0;
 }
 
-INLINE int parse_section_header(FILE *file, SectionHeader *header) {
-    CHECK(read_u16(file, &header->id));
-    CHECK(read_u16(file, &header->flags));
-    CHECK(read_u32(file, &header->offset));
-    CHECK(read_u32(file, &header->size));
+INLINE int parse_section_header(Section *s, SectionHeader *header) {
+    CHECK(read_u16(s, &header->id));
+    CHECK(read_u16(s, &header->flags));
+    CHECK(read_u32(s, &header->offset));
+    CHECK(read_u32(s, &header->size));
     if (header->size > 64 * 1024 * 1024) return 1;
-    CHECK(read_u32(file, NULL));
+    CHECK(read_u32(s, NULL));
     return 0;
 }
 
-int read_string(FILE* file, String *string) {
-    CHECK(read_u32(file, &string->length));
-    string->data = malloc(string->length * sizeof(char));
-    if (fread(string->data, string->length * sizeof(char), 1, file) != string->length * sizeof(char)) {
-        free(string->data);
-        return 1;
+INLINE int read_string(Section *s, String *string) {
+    if (string == NULL) {
+        u32 length;
+        CHECK(read_u32(s, &length));
+        if (s->index + length >= s->size) return 1;
+        s->index += length;
+    } else {
+        CHECK(read_u32(s, &string->length));
+        if (s->index + string->length >= s->size) return 1;
+        string->data = malloc(string->length * sizeof(char));
+        memcpy(string->data, s->data + s->start + s->index, string->length * sizeof(char));
+        s->index += string->length;
     }
+
     return 0;
 }
 
@@ -342,42 +396,43 @@ INLINE void safe_free(void *ptr) {
     if (ptr != NULL) free(ptr);
 }
 
-#define SECTION_PARSER_START(list, type)\
+#define SECTION_PARSER_START(list, type, min_size)\
     program->n_##list = 0, program->list = NULL;\
-    fseek(file, section.offset, SEEK_SET);\
-    CHECK(read_u32(file, &program->n_##list));\
+    CHECK(read_u32(&s, &program->n_##list));\
+    if ((program->n_##list * min_size) + s.index > s.size) return 1;\
     program->list = calloc(program->n_##list, sizeof(type));
 
-INLINE int parse_module_table(FILE *file, SectionHeader section, Program *program) {
-    SECTION_PARSER_START(modules, Module);
+INLINE int parse_module_table(Section s, Program *program) {
+    SECTION_PARSER_START(modules, Module, 16);
     for (u32 i = 0; i < program->n_modules; i++) {
-        Module module;
-        CHECK(read_u32(file, &module.id));
-        CHECK(read_string(file, &module.path));
-        CHECK(read_u32(file, &module.init_func));
-        CHECK(read_u32(file, &module.n_types));
-        module.types = calloc(module.n_types, sizeof(Type));
-        for (u32 j = 0; j < module.n_types; j++) {
-            Type type;
-            CHECK(read_string(file, &type.type_name));
-            CHECK(read_u8(file, &type.exported));
-            CHECK(read_u32(file, &type.n_fields));
-            type.field_names = calloc(type.n_fields, sizeof(String));
-            for (u32 k = 0; k < type.n_fields; k++) CHECK(read_string(file, &type.field_names[k]));
-            module.types[j] = type;
+        Module *module = &program->modules[i];
+        CHECK(read_u32(&s, &module->id));
+        CHECK(read_string(&s, &module->path));
+        CHECK(read_u32(&s, &module->init_func));
+        CHECK(read_u32(&s, &module->n_types));
+        if ((module->n_types * 9) + s.index > s.size) return 1;
+        module->types = calloc(module->n_types, sizeof(Type));
+        for (u32 j = 0; j < module->n_types; j++) {
+            Type *type = &module->types[j];
+            CHECK(read_string(&s, &type->type_name));
+            CHECK(read_u8(&s, &type->exported));
+            CHECK(read_u32(&s, &type->n_fields));
+            if ((type->n_fields * 4) + s.index > s.size) return 1;
+            type->field_names = calloc(type->n_fields, sizeof(String));
+            for (u32 k = 0; k < type->n_fields; k++) CHECK(read_string(&s, &type->field_names[k]));
         }
-        program->modules[i] = module;
     }
-    if (ftell(file) != section.offset + section.size - 1) return 1; // possible bug
+    if (s.index != s.size - 1) return 1; // possible bug
     return 0;
 }
 
 INLINE void free_module_table(Program *program) {
-    for (u32 i = 0; i < program->n_modules; i++) {
+    if (program->constants != NULL) for (u32 i = 0; i < program->n_modules; i++) {
         Module *module = &program->modules[i];
-        for (u32 j = 0; j < module->n_types; j++) {
+        if (module->types != NULL) for (u32 j = 0; j < module->n_types; j++) {
             Type *type = &module->types[j];
-            for (u32 k = 0; k < type->n_fields; k++) safe_free(type->field_names[k].data);
+            if (type->field_names != NULL)
+                for (u32 k = 0; k < type->n_fields; k++) safe_free(type->field_names[k].data);
             safe_free(type->field_names), safe_free(type->type_name.data);
         }
         safe_free(module->types), safe_free(module->path.data);
@@ -385,61 +440,83 @@ INLINE void free_module_table(Program *program) {
     safe_free(program->modules);
 }
 
-INLINE int parse_const_pool(FILE *file, SectionHeader section, Program *program) {
-    SECTION_PARSER_START(constants, Constant);
+INLINE int parse_const_pool(Section s, Program *program) {
+    SECTION_PARSER_START(constants, Constant, 4);
     for (u32 i = 0; i < program->n_constants; i++) {
-        Constant constant;
+        Constant *constant = &program->constants[i];
         u8 kind;
-        CHECK(read_u8(file, &kind));
+        CHECK(read_u8(&s, &kind));
         if (kind >= CONSTANT_TYPE_ENUM_END) return 1;
-        constant.type = kind;
-        CHECK(read_u8(file, NULL));
-        CHECK(read_u16(file, NULL));
-        switch (constant.type) {
+        constant->type = kind;
+        CHECK(read_u8(&s, NULL));
+        CHECK(read_u16(&s, NULL));
+        switch (constant->type) {
             case CONSTANT_TYPE_INTEGER:
-                CHECK(read_i64(file, &constant.data.integer));
+                CHECK(read_i64(&s, &constant->data.integer));
                 break;
             case CONSTANT_TYPE_FLOATING:
-                CHECK(read_f64(file, &constant.data.floating));
+                CHECK(read_f64(&s, &constant->data.floating));
                 break;
             case CONSTANT_TYPE_STRING:
-                CHECK(read_string(file, &constant.data.string));
+                CHECK(read_string(&s, &constant->data.string));
                 break;
             case CONSTANT_TYPE_BOOLEAN:
                 u8 temp;
-                CHECK(read_u8(file, &temp));
-                constant.data.boolean = temp != 0;
+                CHECK(read_u8(&s, &temp));
+                constant->data.boolean = temp == 1;
                 break;
             default: break;
         }
-        program->constants[i] = constant;
     }
-    if (ftell(file) != section.offset + section.size - 1) return 1; // possible bug
     return 0;
 }
 
-int parse_container(FILE* file) {
-    Program program;
+INLINE void free_const_pool(Program *program) {
+    if (program->constants != NULL) for (u32 i = 0; i < program->n_constants; i++) {
+        Constant *constant = &program->constants[i];
+        if (constant->type == CONSTANT_TYPE_STRING) safe_free(constant->data.string.data);
+    }
+    safe_free(program->constants);
+}
 
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    rewind(file);
+INLINE int parse_function_table(Section s, Program *program) {
+    SECTION_PARSER_START(functions, Function, 24);
+    for (u32 i = 0; i < program->n_functions; i++) {
+        Function *function = &program->functions[i];
+        CHECK(read_u32(&s, &function->id));
+        CHECK(read_u32(&s, &function->module_id));
+        CHECK(read_string(&s, &function->name));
+        CHECK(read_u16(&s, &function->register_count));
+        CHECK(read_u16(&s, &function->n_param_names));
+        CHECK(read_u32(&s, &function->code_offset));
+        CHECK(read_u32(&s, &function->code_length));
+        if ((function->n_param_names * 4) + s.index > s.size) return 1;
+        function->param_names = calloc(function->n_param_names, sizeof(String));
+        for (u32 j = 0; j < function->n_param_names; j++) CHECK(read_string(&s, &function->param_names[j]));
+    }
+    if (s.index != s.size - 1) return 1;
+    return 0;
+}
+
+int parse_container(MappedFile file) {
+    Program program;
+    Section s = {.data = file.memory, .size = file.size};
 
     Header header;
-    CHECK(parse_header(file, &header));
+    CHECK(parse_header(&s, &header));
 
-    SectionHeader *required[SECTION_ID_ENUM_END] = {0};
-    SectionHeader *sections = malloc(header.section_count * sizeof(SectionHeader));
+    Section *required[SECTION_ID_ENUM_END] = {0};
+    Section *sections = malloc(header.section_count * sizeof(SectionHeader));
     u32 n_sections = 0;
 
     for (u32 i = 0; i < header.section_count; i++) {
         SectionHeader section;
-        if (parse_section_header(file, &section) != 0) goto error1;
-        if (section.offset + section.size >= size) goto error1;
+        if (parse_section_header(&s, &section)) goto error1;
+        if (section.offset + section.size >= s.size) goto error1;
         if (section.offset < 16 + (header.section_count * 20)) goto error1;
         for (u32 j = 0; j < n_sections; j++)
-            if (section.offset <= sections[j].offset + sections[j].size &&
-                section.offset + section.size >= sections[j].offset) goto error1;
+            if (section.offset <= sections[j].start + sections[j].size &&
+                section.offset + section.size >= sections[j].start) goto error1;
         if (section.id >= SECTION_ID_ENUM_END) {
             if (section.flags & SECTION_FLAG_REQUIRED) goto error1;
             if (!(section.flags & SECTION_FLAG_OPTIONAL)) goto error1;
@@ -447,15 +524,17 @@ int parse_container(FILE* file) {
             if (required[section.id] != NULL) goto error1;
             required[section.id] = &sections[n_sections];
         }
-        sections[n_sections++] = section;
+        sections[n_sections++] = (Section){.data = s.data, .start = section.offset, .size = section.size};
     }
 
     for (u32 i = 0; i < SECTION_ID_ENUM_END; i++) if (required[i] == NULL) goto error1;
 
-    if (parse_module_table(file, *required[SECTION_ID_MODULE_TABLE], &program)) goto error2;
+    if (parse_module_table(*required[SECTION_ID_MODULE_TABLE], &program)) goto error2;
+    if (parse_const_pool(*required[SECTION_ID_CONST_POOL], &program)) goto error3;
 
     return 0;
 
+    error3: free_const_pool(&program);
     error2: free_module_table(&program);
     error1: free(sections);
     return 1;
@@ -463,13 +542,13 @@ int parse_container(FILE* file) {
 
 int main(int argc, const char** argv) {
     if (argc != 2) return 1;
-    FILE* file = fopen(argv[1], "rwb");
-    if (file == NULL) return 1;
+    MappedFile file = memory_map_file(argv[1]);
+    if (file.memory == NULL) return 1;
     if (parse_container(file) != 0) goto error;
-    fclose(file);
+    memory_unmap_file(file);
 
     return 0;
 
-    error: fclose(file);
+    error: memory_unmap_file(file);
     return 1;
 }
