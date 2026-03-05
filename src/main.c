@@ -597,6 +597,19 @@ INLINE int parse_metadata(Section s, Program *program) {
     return 0;
 }
 
+INLINE int verify_container(Program* program) {
+    for (u32 i = 0; i < program->n_functions; i++) if (program->functions[i].code_length == 0) return 1;
+    for (u32 i = 0; i < program->n_functions; i++) {
+        Function *function = &program->functions[i];
+        if (function->code_offset + function->code_length > program->n_code) return 1;
+        if (function->code_offset > program->n_code) return 1;
+    }
+
+
+
+    return 0;
+}
+
 int parse_container(MappedFile file) {
     Program program;
     Section s = {.data = file.memory, .size = file.size};
