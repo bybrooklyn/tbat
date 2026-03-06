@@ -2,3 +2,5 @@
 
 /obj
 program
+/.zig-cache
+/zig-out
